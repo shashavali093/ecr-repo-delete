@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+
+#############################################
+
+Description: create ecr repo and custom resouce to delete the images
+
+Resources:
+  
+  EmptyECRImagesLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - lambda.amazonaws.com
+                - events.amazonaws.com
+            Action: 
+            - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+        - arn:aws:iam::aws:policy/AWSLambda_FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+
+  EmptyECRImagesLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+          import json, boto3, logging
+          import cfnresponse
+          import urllib3
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+        
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+
+          http = urllib3.PoolManager()
+          
+          def lambda_handler(event, context):
+              logger.info("event: {}".format(event))
+              client = boto3.client('ecr')
+              try:
+                  ECR_REPO = event['ResourceProperties']['ECR_REPO']
+                  logger.info("ECR_REPO: {}, event['RequestType']: {}".format(ECR_REPO,event['RequestType']))
+                  if event['RequestType'] == 'Delete':
+                      print('Deleting existing images...')
+                      image_ids= client.list_images(repositoryName=ECR_REPO)['imageIds']
+                      response=client.batch_delete_image(repositoryName=ECR_REPO,imageIds=image_ids)
+                      print("Existing Images are deleted")
+                  sendResponseCfn(event, context, cfnresponse.SUCCESS)
+              except Exception as e:
+                  logger.info("Exception: {}".format(e))
+                  logger.exception("Couldn't delete all versions found Exception")
+                  sendResponseCfn(event, context, cfnresponse.FAILED)
+          
+          def sendResponseCfn(event, context, responseStatus):
+            responseData = {}
+            responseData['Data'] = {}
+            cfnresponse.send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")
+
+
+          def send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False, reason=None):
+              responseUrl = event['ResponseURL']
+          
+              print(responseUrl)
+          
+              responseBody = {
+                  'Status' : responseStatus,
+                  'Reason' : reason or "See the details in CloudWatch Log Stream: {}".format(context.log_stream_name),
+                  'PhysicalResourceId' : physicalResourceId or context.log_stream_name,
+                  'StackId' : event['StackId'],
+                  'RequestId' : event['RequestId'],
+                  'LogicalResourceId' : event['LogicalResourceId'],
+                  'NoEcho' : noEcho,
+                  'Data' : responseData
+              }
+          
+              json_responseBody = json.dumps(responseBody)
+          
+              print("Response body:")
+              print(json_responseBody)
+          
+              headers = {
+                  'content-type' : '',
+                  'content-length' : str(len(json_responseBody))
+              }
+          
+              try:
+                  response = http.request('PUT', responseUrl, headers=headers, body=json_responseBody)
+                  print("Status code:", response.status)
+          
+          
+              except Exception as e:
+          
+                  print("send(..) failed executing http.request(..):", e)
+      Role: !GetAtt EmptyECRImagesLambdaRole.Arn
+      Runtime: python3.7  
+      Timeout: 30
+
+  cleanupECRImages:
+      Type: Custom::ECRImages
+      Properties:
+        ServiceToken: !GetAtt EmptyECRImagesLambda.Arn
+        ECR_REPO: !Ref Repository
+      DependsOn: Repository  
+
+  Repository:
+        Type: AWS::ECR::Repository
+        DeletionPolicy: Delete  
